@@ -7,7 +7,7 @@
 #include <string.h>
 #include "wavread.h"
 
-#pragma warning(disable:4996)
+//#pragma warning(disable:4996)
 
 /* wavread関数の移植 */
 double * wavread(char* filename, int *fs, int *Nbit, int *waveLength, int *offset, int *endbr)
@@ -25,7 +25,8 @@ double * wavread(char* filename, int *fs, int *Nbit, int *waveLength, int *offse
 	fp = fopen(filename, "rb");
 	if(NULL == fp) 
 	{
-		printf("ファイルのロードに失敗\n");
+	  //printf("ファイルのロードに失敗\n");
+	  printf("Loading file %s failed.\n", filename);
 		return NULL;
 	}
 	//ヘッダのチェック
@@ -33,7 +34,8 @@ double * wavread(char* filename, int *fs, int *Nbit, int *waveLength, int *offse
 	if(0 != strcmp(dataCheck,"RIFF"))
 	{
 		fclose(fp);
-		printf("ヘッダRIFFが不正\n");
+		//printf("ヘッダRIFFが不正\n");
+		printf("Incorrect RIFF header\n");
 		return NULL;
 	}
 	fseek(fp, 4, SEEK_CUR); // 4バイト飛ばす
@@ -41,28 +43,32 @@ double * wavread(char* filename, int *fs, int *Nbit, int *waveLength, int *offse
 	if(0 != strcmp(dataCheck,"WAVE"))
 	{
 		fclose(fp);
-		printf("ヘッダWAVEが不正\n");
+		//printf("ヘッダWAVEが不正\n");
+		printf("Incorrect WAVE header\n");
 		return NULL;
 	}
 	fread(dataCheck, sizeof(char), 4, fp); // "fmt "
 	if(0 != strcmp(dataCheck,"fmt "))
 	{
 		fclose(fp);
-		printf("ヘッダfmt が不正\n");
+		//printf("ヘッダfmt が不正\n");
+		printf("Incorrect fmt header\n");
 		return NULL;
 	}
 	fread(dataCheck, sizeof(char), 4, fp); //1 0 0 0
 	if(!(16 == dataCheck[0] && 0 == dataCheck[1] && 0 == dataCheck[2] && 0 == dataCheck[3]))
 	{
 		fclose(fp);
-		printf("ヘッダfmt (2)が不正\n");
+		//printf("ヘッダfmt (2)が不正\n");
+		printf("Incorrect fmt header (2)\n");
 		return NULL;
 	}
 	fread(dataCheck, sizeof(char), 2, fp); //1 0
 	if(!(1 == dataCheck[0] && 0 == dataCheck[1]))
 	{
 		fclose(fp);
-		printf("フォーマットIDが不正\n");
+		//printf("フォーマットIDが不正\n");
+		printf("Incorrect format ID\n");
 		return NULL;
 	}
 	/*
@@ -75,14 +81,17 @@ double * wavread(char* filename, int *fs, int *Nbit, int *waveLength, int *offse
 	}
 	*/
 	//チャンネル
-	fread(&channel, sizeof(short int), 1, fp); 
+	//fread(&channel, sizeof(short int), 1, fp); 
+	fread(forIntNumber, sizeof(char), 2, fp);
+	channel = forIntNumber[0];
+	//printf("\nChannel: %d\n", channel);
 
 	// サンプリング周波数
 	fread(forIntNumber, sizeof(char), 4, fp);
 	*fs = 0;
 	for(int i = 3;i >= 0;i--)
 	{
-		*fs = *fs*256 + forIntNumber[i];
+	  *fs = (*fs << 8) + forIntNumber[i];
 	}
 	// 量子化ビット数
 	fseek(fp, 6, SEEK_CUR); // 6バイト飛ばす
@@ -105,7 +114,7 @@ double * wavread(char* filename, int *fs, int *Nbit, int *waveLength, int *offse
 	*waveLength = 0;
 	for(int i = 3;i >= 0;i--)
 	{
-		*waveLength = *waveLength*256 + forIntNumber[i];
+	  *waveLength = (*waveLength << 8) + forIntNumber[i];
 	}
 	*waveLength /= (*Nbit/8 * channel);
 
