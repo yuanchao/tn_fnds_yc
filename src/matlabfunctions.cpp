@@ -164,7 +164,7 @@ void filterForDecimate(double *x, int xLen, double *y, int r)
 }
 
 // matlab‚É‡‚¸‚éŠÛ‚ß
-int round(double x)
+int roundi(double x)
 {
 	if(x > 0)
 		return (int)(x+0.5);
