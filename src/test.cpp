@@ -42,7 +42,7 @@
 // 分析シフト量 [msec]
 #define FRAMEPERIOD 2.0
 
-#pragma comment(lib, "winmm.lib")
+//#pragma comment(lib, "winmm.lib")
 
 
 
@@ -527,6 +527,7 @@ void breath2(double *f0, int tLen, int fs, double *x, int xLen, fftw_complex **w
 
 	noiseData = (double *)malloc(sizeof(double) * xLen);
 	for(i=0;i < xLen; i++) noiseData[i] = (double)rand()/(RAND_MAX+1) - 0.5;
+	//for(i=0;i < xLen; i++) noiseData[i] = (double)rand(); // /(RAND_MAX) - 0.5;
 	noise = (double *)malloc(sizeof(double) * xLen);
 	for(i=0;i < xLen; i++) noise[i] = 0.0;
 //	for(i=0;i < xLen; i++) noiseData[i] *= noiseData[i] * (noiseData[i] < 0)? -1 : 1;//ノイズの分布をいじる
@@ -880,7 +881,8 @@ int main(int argc, char *argv[])
 
 	if(argc < 3) 
 	{
-		printf("error: 引数の数が不正です．\n");
+	        //printf("error: 引数の数が不正です．\n");
+		printf("error: the number of parameters is not correct.\n");
 		return 0;
 	}
 
@@ -969,12 +971,13 @@ int main(int argc, char *argv[])
 	int stp = offset;
 
 	int fs, nbit;
-//	x = wavread(argv[1], &fs, &nbit, &signalLen);
+	//x = wavread(argv[1], &fs, &nbit, &signalLen);
 	x = wavread(argv[1], &fs, &nbit, &signalLen, &offset, &edLengthMsec);
 
 	if(x == NULL)
 	{
-		printf("error: 指定されたファイルは存在しません．\n");
+	        //printf("error: 指定されたファイルは存在しません．\n");
+		printf("error: The specified file doesnot exist.\n");
 		return 0;
 	}
 
@@ -1187,11 +1190,11 @@ int main(int argc, char *argv[])
 	maxAmp = 0.0;
 	double volume;
 	volume = (double)atoi(argv[10]) / 100.0;
-	for(i = 0;i < signalLen2;i++) maxAmp = maxAmp < abs(y[i]) ? abs(y[i]) : maxAmp;
+	for(i = 0;i < signalLen2;i++) maxAmp = maxAmp < fabs(y[i]) ? fabs(y[i]) : maxAmp;
 	for(i = 0;i < signalLen2;i++) output[i] = (short)(32768.0*(y[i]*0.5 * volume/maxAmp));
 
 	fp = fopen(argv[1], "rb");
-	fread(header, sizeof(char), 22, fp);
+	fread(header, sizeof(char), 44, fp);
 	fclose(fp);
 
 	*((short int*)(&header[22])) = 1;		//channels	 	2 	チャンネル数

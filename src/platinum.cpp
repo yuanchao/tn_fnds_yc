@@ -60,7 +60,7 @@ void getOneFrameResidualSignal(double *x, int xLen, int fs, int positionIndex, d
 	double tmpValue = 100000.0; // safeGuard
 	for(i = 0;i < pCount;i++)
 	{
-		tmp = abs(pulseLocations[i] - (double)positionIndex*framePeriod);//フレームに最も近いパルス？を探す
+		tmp = fabs(pulseLocations[i] - (double)positionIndex*framePeriod);//フレームに最も近いパルス？を探す
 		if(tmp < tmpValue)
 		{
 			tmpValue = tmp;
@@ -164,7 +164,7 @@ void getFrameResidualIndex(int tLen, int pCount, double framePeriod, double *pul
 		tmpIndex = pCount-1;
 		for(i = 0;i < pCount-1;i++)
 		{
-			tmp = abs(pulseLocations[i] +  - (double)j*framePeriod);//フレームに最も近いパルス？を探す
+			tmp = fabs(pulseLocations[i] +  - (double)j*framePeriod);//フレームに最も近いパルス？を探す
 			if(tmp < tmpValue)
 			{
 				tmpValue = tmp;
@@ -272,7 +272,7 @@ void getWedgeList(double *x, int xLen, int vuvNum, int *stList, int *edList, int
 		peakIndex = 0;
 		for(j = 0;j < T0*2+1;j++)//波形のピークのサンプル位置を検出
 		{
-			if(abs(tmpWav[j]) > peak)
+			if(fabs(tmpWav[j]) > peak)
 			{
 				peak = tmpWav[j];
 				peakIndex = j;
