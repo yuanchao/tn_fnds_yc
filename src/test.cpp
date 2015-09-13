@@ -526,8 +526,8 @@ void breath2(double *f0, int tLen, int fs, double *x, int xLen, fftw_complex **w
 	fftw_complex		*noiseSpec;	// スペクトル
 
 	noiseData = (double *)malloc(sizeof(double) * xLen);
-	for(i=0;i < xLen; i++) noiseData[i] = (double)rand()/(RAND_MAX+1) - 0.5;
-	//for(i=0;i < xLen; i++) noiseData[i] = (double)rand(); // /(RAND_MAX) - 0.5;
+	//for(i=0;i < xLen; i++) noiseData[i] = (double)rand()/(RAND_MAX+1) - 0.5;
+	for(i=0;i < xLen; i++) noiseData[i] = (double)rand()/((double)RAND_MAX+1) - 0.5;
 	noise = (double *)malloc(sizeof(double) * xLen);
 	for(i=0;i < xLen; i++) noise[i] = 0.0;
 //	for(i=0;i < xLen; i++) noiseData[i] *= noiseData[i] * (noiseData[i] < 0)? -1 : 1;//ノイズの分布をいじる
