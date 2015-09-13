@@ -9,8 +9,7 @@
 // 現状で分かっているバグ
 // decimateForF0 : 開始直後・終了間際4サンプルくらいに誤差が入ります．
 //#include <fftsg.h>
-#include <fftw3.h>
-//#include <fft.h>
+#include <fft.h>
 
 #include <stdlib.h>
 #include <windows.h>
@@ -37,7 +36,7 @@
 // F0推定法 DIO : Distributed Inline-filter Operation
 void dio(double *x, int xLen, int fs, double framePeriod, 
 		 double *timeAxis, double *f0);
-int getSamplesForDIO(int fs, int xLen, double framePeriod);
+int GetSamplesForDIO(int fs, int xLen, double framePeriod);
 
 // スペクトル包絡推定法 STAR : Synchronous Technique and Adroit Restoration
 int getFFTLengthForStar(int fs);

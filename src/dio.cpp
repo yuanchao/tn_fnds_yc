@@ -1,600 +1,677 @@
-//tn_fnds v0.0.5   2012/3/17
-//追加されているコメントには誤りがあるかもしれません。
+//-----------------------------------------------------------------------------
+// Copyright 2012-2015 Masanori Morise. All Rights Reserved.
+// Author: mmorise [at] yamanashi.ac.jp (Masanori Morise)
+//
+// F0 estimation based on DIO (Distributed Inline-filter Operation).
+//-----------------------------------------------------------------------------
+#include "./dio.h"
 
-#include "world.h"
+#include <math.h>
 
-// 内部関数(ユーザは触らないほうが良い)
-//void rawEventByDio(double boundaryF0, double fs, fftw_complex *xSpec, int xLength, int fftl, double shiftTime, double f0Floor, double f0Ceil, double *timeAxis, int tLen, 
-//				   double *f0Deviations, double *interpolatedF0);
-//tn_fnds v0.0.4
-void rawEventByDio(double boundaryF0, double fs, fftw_complex *xSpec, int xLength, int fftl, double shiftTime, double f0Floor, double f0Ceil, double *timeAxis, int tLen, 
-				   double *f0Deviations, double *interpolatedF0,
-				   fftw_plan &forwardFFT, fftw_plan &inverseFFT, double *equivalentFIR, fftw_complex *eSpec);
-void zeroCrossingEngine(double *x, int xLen, double fs,
-						double *eLocations, double *iLocations, double *intervals, int *iLen);
-long decimateForF0(double *x, int xLen, double *y, int r);
-void filterForDecimate(double *x, int xLen, double *y, int r);
-void nuttallWindow(int yLen, double *y);
-//void postprocessing(double framePeriod, double f0Floor, int candidates, int xLen, int fs, 
-//					double **f0Map, double *bestF0, double *f0);
-//tn_fnds v0.0.4
-void postprocessing(double framePeriod, double f0Floor, int candidates, int xLen, int fs, double **f0Map,
-	               double **stabilityMap, double *bestF0, double *f0);
-void interp1(double *t, double *y, int iLen, double *t1, int oLen, double *y1);
-void histc(double *x, int xLen, double *y, int yLen, int *index);
+#include "./constantnumbers.h"
+#include "./matlabfunctions.h"
 
-// F0軌跡の要素数を得る（事前にユーザがメモリ確保できるように）
-// framePeriod の単位はmsec
-int getSamplesForDIO(int fs, int xLen, double framePeriod)
-{
-	return (int)((double)xLen / (double)fs / (framePeriod/1000.0) ) + 1;
+//-----------------------------------------------------------------------------
+// struct for RawEventByDio()
+// "negative" means "zero-crossing point going from positive to negative"
+// "positive" means "zero-crossing point going from negative to positive"
+//-----------------------------------------------------------------------------
+typedef struct {
+  double *negative_interval_locations;
+  double *negative_intervals;
+  int number_of_negatives;
+  double *positive_interval_locations;
+  double *positive_intervals;
+  int number_of_positives;
+  double *peak_interval_locations;
+  double *peak_intervals;
+  int number_of_peaks;
+  double *dip_interval_locations;
+  double *dip_intervals;
+  int number_of_dips;
+} ZeroCrossings;
+
+namespace {
+//-----------------------------------------------------------------------------
+// DesignLowCutFilter() calculates the coefficients the filter.
+//-----------------------------------------------------------------------------
+void DesignLowCutFilter(int N, int fft_size, double *low_cut_filter) {
+  for (int i = 1; i <= N; ++i)
+    low_cut_filter[i - 1] = 0.5 - 0.5 * cos(i * 2.0 * world::kPi / (N + 1));
+  for (int i = N; i < fft_size; ++i) low_cut_filter[i] = 0.0;
+  double sum_of_amplitude = 0.0;
+  for (int i = 0; i < N; ++i) sum_of_amplitude += low_cut_filter[i];
+  for (int i = 0; i < N; ++i)
+    low_cut_filter[i] = -low_cut_filter[i] / sum_of_amplitude;
+  for (int i = 0; i < (N - 1) / 2; ++i)
+    low_cut_filter[fft_size - (N - 1) / 2 + i] = low_cut_filter[i];
+  for (int i = 0; i < N; ++i)
+    low_cut_filter[i] = low_cut_filter[i + (N - 1) / 2];
+  low_cut_filter[0] += 1.0;
 }
 
-// DIO (Distributed Inline filter Operation) によるF0推定
-// x	: 入力信号
-// xLen : 信号長 [sample].
-// f0	: 推定結果
-void dio(double *x, int xLen, int fs, double framePeriod, 
-		 double *timeAxis, double *f0)
-{
-	int i,j;
+//-----------------------------------------------------------------------------
+// GetDownsampledSignal() calculates the spectrum for estimation.
+// This function carries out downsampling to speed up the estimation process
+// and calculates the spectrum of the downsampled signal.
+//-----------------------------------------------------------------------------
+void GetSpectrumForEstimation(double *x, int x_length, int y_length,
+    double actual_fs, int fft_size, int decimation_ratio,
+    fft_complex *y_spectrum) {
+  double *y = new double[fft_size];
 
-	// 初期条件 (改良したい人はここから頑張って)
-	double f0Floor = 80;
-	double f0Ceil = 640;
-	double channelsInOctave = 2;
-	double targetFs = 4000;
+  // Downsampling
+  if (decimation_ratio != 1) {
+    decimate(x, x_length, decimation_ratio, y);
+  } else {
+    for (int i = 0; i < x_length; ++i) y[i] = x[i];
+  }
 
-	// 基礎パラメタの計算
-	int decimationRatio = (int)(fs/targetFs);
-	double fss = (double)fs/(double)decimationRatio;
-	int nBands = (int)(log((double)f0Ceil/(double)f0Floor)/log(2.0) * channelsInOctave);
+  // Removal of the DC component (y = y - mean value of y)
+  double mean_y = 0.0;
+  for (int i = 0; i < y_length; ++i) mean_y += y[i];
+  mean_y /= y_length;
+  for (int i = 0; i < y_length; ++i) y[i] -= mean_y;
+  for (int i = y_length; i < fft_size; ++i) y[i] = 0.0;
 
-	// ここも基礎パラメタ
-	double * boundaryF0List = (double *)malloc(sizeof(double) * (nBands+1));
-	for(i = 0;i <= nBands;i++)
-		boundaryF0List[i] = f0Floor*pow(2.0, i/channelsInOctave);
+  fft_plan forwardFFT =
+    fft_plan_dft_r2c_1d(fft_size, y, y_spectrum, FFT_ESTIMATE);
+  fft_execute(forwardFFT);
 
-	// fft Lengthの計算
-	int yLen = (1 + (int)(xLen/decimationRatio));
-	int fftl = (int)pow(2.0, 1.0 + (int)(log((double)yLen + 
-		(double)(4*(int)(1.0 + (double)fs/boundaryF0List[0]/2.0)) ) / log(2.0)));
-	double *y = (double *)malloc(sizeof(double) * fftl);
-	
-	// ダウンサンプリング
-	decimateForF0(x, xLen, y, decimationRatio);
+  // Low cut filtering (from 0.1.4)
+  int cutoff_in_sample = matlab_round(actual_fs / 50.0);  // Cutoff is 50.0 Hz
+  DesignLowCutFilter(cutoff_in_sample * 2 + 1, fft_size, y);
 
-	// 直流成分の除去 y = y - mean(y)
-	double meanY = 0.0;
-	for(i = 0;i < yLen;i++)			meanY += y[i];
-	meanY /= (double)yLen;
-	for(i = 0;i < yLen;i++)			y[i] -= meanY;
-	for(i = yLen; i < fftl;i++)		y[i] = 0.0;
+  fft_complex *filter_spectrum = new fft_complex[fft_size];
+  forwardFFT.c_out = filter_spectrum;
+  fft_execute(forwardFFT);
 
-	// 中間データの保存用
-	int		tLen; // F0軌跡のサンプル数
-	tLen = getSamplesForDIO(fs, xLen, framePeriod); // debug
-	int lengthInMs = 1 + (int)((double)xLen/(double)fs*1000.0);
-	double **stabilityMap, ** f0Map; // f0mapに候補が全て入るので，結果に納得できない場合は，f0Mapを直接操作する．
-	stabilityMap = (double **)malloc(sizeof(double *) * (nBands+1));
-	f0Map		 = (double **)malloc(sizeof(double *) * (nBands+1));
-	for(i = 0;i <= nBands;i++)
-	{
-		stabilityMap[i] = (double *)malloc(sizeof(double) * tLen);
-		f0Map[i]		= (double *)malloc(sizeof(double) * tLen);
-	}
+  double tmp = 0;
+  for (int i = 0; i <= fft_size / 2; ++i) {
+    tmp = y_spectrum[i][0] * filter_spectrum[i][0] -
+      y_spectrum[i][1] * filter_spectrum[i][1];
+    y_spectrum[i][1] = y_spectrum[i][0] * filter_spectrum[i][1] +
+      y_spectrum[i][1] * filter_spectrum[i][0];
+    y_spectrum[i][0] = tmp;
+  }
 
-	// 波形のスペクトルを事前に計算（ここは高速化の余地有り）
-	fftw_plan			forwardFFT;				// FFTセット
-	fftw_complex		*ySpec;	// スペクトル
-	ySpec = (fftw_complex *)malloc(sizeof(fftw_complex) * fftl);
-	forwardFFT = fftw_plan_dft_r2c_1d(fftl, y, ySpec, FFTW_ESTIMATE);
-	fftw_execute(forwardFFT); // FFTの実行
-
-	// temporary values
-	double *	interpolatedF0;
-	double *	f0Deviations;
-	interpolatedF0 = (double *) malloc(sizeof(double) * lengthInMs);
-	f0Deviations   = (double *) malloc(sizeof(double) * lengthInMs);
-
-	for(i = 0;i < tLen;i++)
-		timeAxis[i] = (double)i * framePeriod/1000.0;
-
-	//tn_fnds v0.0.4 FFTWのプランを再利用するため、DIO側でメモリ確保、プランの作成を行う
-	fftw_destroy_plan(forwardFFT);
-	double *equivalentFIR;
-	equivalentFIR = (double *)malloc(sizeof(double) * fftl);
-//	fftw_plan	forwardFFT;				// FFTセット
-	fftw_plan	inverseFFT;
-	fftw_complex		*eSpec;	// スペクトル
-	eSpec = (fftw_complex *)malloc(sizeof(fftw_complex) * fftl);
-	forwardFFT = fftw_plan_dft_r2c_1d(fftl, equivalentFIR, eSpec, FFTW_ESTIMATE);
-	inverseFFT = fftw_plan_dft_c2r_1d(fftl, eSpec, equivalentFIR, FFTW_ESTIMATE);
-
-	// イベントの計算 (4つのゼロ交差．詳しくは論文にて)
-	for(i = 0;i <= nBands;i++)
-	{
-//		rawEventByDio(boundaryF0List[i], fss, ySpec, yLen, fftl, framePeriod/1000.0, f0Floor, f0Ceil, timeAxis, tLen, 
-//			f0Deviations, interpolatedF0);
-//tn_fnds v0.0.4 FFTWのプランを再利用する
-		rawEventByDio(boundaryF0List[i], fss, ySpec, yLen, fftl, framePeriod/1000.0, f0Floor, f0Ceil, timeAxis, tLen, 
-			f0Deviations, interpolatedF0, forwardFFT, inverseFFT, equivalentFIR, eSpec);
-		for(j = 0;j < tLen;j++)
-		{
-			stabilityMap[i][j] = f0Deviations[j] / (interpolatedF0[j]+0.00000001);
-			f0Map[i][j]        = interpolatedF0[j];
-		}
-	}
-
-	free(equivalentFIR);
-	free(eSpec);
-
-	// ベスト候補の選定 (基本波らしさを使い一意に決める)
-	double *bestF0;
-//	bestF0 = (double *)malloc(sizeof(double) * (int)((double)xLen / (double)fs / (framePeriod/1000.0) ) + 1);
-	bestF0 = (double *)malloc(sizeof(double) * tLen); // 2010/6/14 修正 (死にたい)
-/* tn_fnds v0.0.4 ベスト候補の選定は全てpostprocessingで行うようにした
-	double tmp;
-	for(i = 0;i < tLen;i++)
-	{
-		tmp = stabilityMap[0][i];
-		bestF0[i] = (stabilityMap[0][i] < 0.002) ? f0Map[0][i] : 0.0;
-		for(j = 1;j <= nBands;j++)
-		{
-			if(tmp > stabilityMap[j][i] && stabilityMap[j][i] < 0.002)
-			{
-				tmp = stabilityMap[j][i];
-				bestF0[i] = f0Map[j][i];
-			}
-		}
-	}
-*/
-	// 後処理 (第一候補と候補マップから最適なパスを探す)
-//	postprocessing(framePeriod/1000.0, f0Floor, nBands+1, xLen, fs, f0Map, bestF0, f0);
-	//tn_fnds v0.0.4 F0補正にstabilityMapを使用するようにした
-	postprocessing(framePeriod/1000.0, f0Floor, nBands+1, xLen, fs, f0Map, stabilityMap, bestF0, f0);
-
-	// お片づけ(メモリの開放)
-	free(bestF0);
-	free(interpolatedF0);
-	free(f0Deviations);
-	fftw_destroy_plan(forwardFFT);
-	fftw_destroy_plan(inverseFFT);
-	free(ySpec);
-	for(i = 0;i <= nBands;i++)
-	{
-		free(stabilityMap[i]);
-		free(f0Map[i]);
-	}
-	free(stabilityMap);
-	free(f0Map);
-	free(boundaryF0List);
-	free(y);
+  fft_destroy_plan(forwardFFT);
+  delete[] y;
+  delete[] filter_spectrum;
 }
 
-// イベント数があったか判定
-// longの範囲を超えてしまったので苦肉の策
-int checkEvent(int x)
-{
-	if(x > 0) return 1;
-	return 0;
+//-----------------------------------------------------------------------------
+// GetBestF0Contour() calculates the best f0 contour based on stabilities of
+// all candidates. The F0 whose stability is minimum is selected.
+//-----------------------------------------------------------------------------
+void GetBestF0Contour(int f0_length, double **f0_candidate_map,
+    double **f0_stability_map, int number_of_bands, double *best_f0_contour) {
+  double tmp;
+  for (int i = 0; i < f0_length; ++i) {
+    tmp = f0_stability_map[0][i];
+    best_f0_contour[i] = f0_candidate_map[0][i];
+    for (int j = 1; j < number_of_bands; ++j) {
+      if (tmp > f0_stability_map[j][i]) {
+        tmp = f0_stability_map[j][i];
+        best_f0_contour[i] = f0_candidate_map[j][i];
+      }
+    }
+  }
 }
 
-// 後処理（4ステップ）
-//void postprocessing(double framePeriod, double f0Floor, int candidates, int xLen, int fs, double **f0Map,
-//					double *bestF0, double *f0)
-void postprocessing(double framePeriod, double f0Floor, int candidates, int xLen, int fs, double **f0Map,
-						double **stabilityMap, double *bestF0, double *f0)
-{
-	int i, j, k;
-	int voiceRangeMinimum = (int)(0.5 + 1.0/framePeriod/f0Floor);
-	int f0Len = (int)((double)xLen / (double)fs / framePeriod) + 1;
-//	double allowedRange = 0.1; // これは5 msecの基準なのでframePeriodに併せて調整する．
-	double allowedRange = 0.1 * framePeriod/0.005; // これは5 msecの基準なのでframePeriodに併せて調整する．
+//-----------------------------------------------------------------------------
+// FixStep1() is the 1st step of the postprocessing.
+// This function eliminates the unnatural change of f0 based on allowed_range.
+//-----------------------------------------------------------------------------
+void FixStep1(double *best_f0_contour, int f0_length, int voice_range_minimum,
+    double allowed_range, double *f0_step1) {
+  double *f0_base = new double[f0_length];
+  // Initialization
+  for (int i = 0; i < voice_range_minimum; ++i) f0_base[i] = 0.0;
+  for (int i = voice_range_minimum; i < f0_length - voice_range_minimum; ++i)
+    f0_base[i] = best_f0_contour[i];
+  for (int i = f0_length - voice_range_minimum; i < f0_length; ++i)
+    f0_base[i] = 0.0;
 
-	//tn_fnds v0.0.4 ベストなF0を抽出（DIO本体からこちらに移動）
-	double tmp;
-	double *bestF0Stab;
-	bestF0Stab = (double *)malloc(sizeof(double) * f0Len);
-	for(i = 0;i < f0Len;i++)
-	{
-		tmp = stabilityMap[0][i];
-		bestF0[i] = 0.0;
-		bestF0Stab[i] = stabilityMap[0][i];
-		for(j = 1;j < candidates;j++)
-		{
-			if(tmp > stabilityMap[j][i])
-			{
-				tmp = stabilityMap[j][i];
-				bestF0[i] = f0Map[j][i];
-				bestF0Stab[i] = stabilityMap[j][i];
-			}
-		}
-	}
+  // Processing to prevent the jumping of f0
+  for (int i = 0; i < voice_range_minimum; ++i) f0_step1[i] = 0.0;
+  for (int i = voice_range_minimum; i < f0_length; ++i)
+    f0_step1[i] = fabs((f0_base[i] - f0_base[i - 1]) /
+    (world::kMySafeGuardMinimum + f0_base[i])) <
+    allowed_range ? f0_base[i] : 0.0;
 
-	//tn_fnds v0.0.4 安定性の低いF0を除外
-	int addCount = 0;
-	double addValue = 0.0;
-	for(i = 0;i < f0Len;i++) 
-	{
-		if(bestF0Stab[i] < 0.05){ addCount++; addValue += bestF0Stab[i];} 
-	}
-	addValue = addValue * 2.0 / addCount;
-	for(i = 0;i < f0Len;i++) if(bestF0Stab[i] > addValue) bestF0[i] = 0.0;
-
-	// メモリ節約はできるけど，どうせ少量なのでデバッグのしやすさを優先
-	double *f0Base;
-	f0Base = (double *)malloc(sizeof(double) * f0Len);
-	double *f0Step1;
-	f0Step1 = (double *)malloc(sizeof(double) * f0Len);
-	double *f0Step2;
-	f0Step2 = (double *)malloc(sizeof(double) * f0Len);
-	double *f0Step3;
-	f0Step3 = (double *)malloc(sizeof(double) * f0Len);
-	double *f0Step4;
-	f0Step4 = (double *)malloc(sizeof(double) * f0Len);
-
-	// まずは初期化
-	for(i = 0;i < voiceRangeMinimum;i++) f0Base[i] = 0;
-	for(;i < f0Len-voiceRangeMinimum;i++) f0Base[i] = bestF0[i];
-	for(;i < f0Len;i++) f0Base[i] = 0;
-	for(i = 0;i < f0Len;i++) f0Step1[i] = 0.0;
-
-	// 第一のステップ (F0の跳躍防止)
-	for(i = voiceRangeMinimum;i < f0Len;i++)
-		if(fabs((f0Base[i]-f0Base[i-1])/(0.00001+f0Base[i]) ) < allowedRange)
-			f0Step1[i] = f0Base[i];
-
-	// 第二のステップ (無声区間の切り離し)
-	for(i = 0;i < f0Len;i++) f0Step2[i] = f0Step1[i];
-	for(i = voiceRangeMinimum;i < f0Len;i++)
-	{
-		for(j = 0;j < voiceRangeMinimum;j++)
-		{
-			if(f0Step1[i-j] == 0)
-			{
-				f0Step2[i] = 0.0;
-				break;
-			}
-		}
-	}
-
-	// tn_fnds v0.0.4  第二のステップ (無声区間の切り離し)逆方向
-	for(i = f0Len-1-voiceRangeMinimum;i >= 0;i--)
-	{
-		for(j = 0;j < voiceRangeMinimum;j++)
-		{
-			if(f0Step1[i+j] == 0)
-			{
-				f0Step2[i] = 0.0;
-				break;
-			}
-		}
-	}
-
-	// 島数の検出
-	int *positiveIndex, *negativeIndex;
-	positiveIndex = (int *)malloc(sizeof(int) * f0Len);
-	negativeIndex = (int *)malloc(sizeof(int) * f0Len);
-	int positiveCount, negativeCount;
-	positiveCount = negativeCount = 0;
-	for(i = 1;i < f0Len;i++)
-	{
-		if(f0Step2[i] == 0 && f0Step2[i-1] != 0)
-			negativeIndex[negativeCount++] = i-1;
-		else if (f0Step2[i-1] == 0 && f0Step2[i] != 0)
-			positiveIndex[positiveCount++] = i;
-	}
-
-	// ステップ3（前向き補正）
-	double refValue1, refValue2, bestError, errorValue;
-	for(i = 0;i < f0Len;i++) f0Step3[i] = f0Step2[i];
-	for(i = 0;i < negativeCount;i++)
-	{
-		for(j = negativeIndex[i];j < f0Len-1;j++)
-		{
-			if(f0Step3[j+1] != 0) break;
-			refValue1 = f0Step3[j]*2 - f0Step3[j-1];
-			refValue2 = f0Step3[j];
-//			bestError = abs(refValue - f0Map[0][j+1]);
-			bestError = min(fabs(refValue1 - f0Map[0][j+1]), fabs(refValue2 - f0Map[0][j+1]));
-			for(k = 1;k < candidates;k++)
-			{
-//				errorValue = abs(refValue - f0Map[k][j+1]);
-				errorValue = min(fabs(refValue1 - f0Map[k][j+1]), fabs(refValue2 - f0Map[k][j+1]));
-//				if(errorValue < bestError)
-				if(errorValue < bestError && stabilityMap[k][j+1] < 0.1) //tn_fnds v0.0.4 安定性の低いF0は使用しない
-				{
-					bestError = errorValue;
-					f0Step3[j+1] = f0Map[k][j+1];
-				}
-			}
-//			if(bestError / (refValue+0.0001) > allowedRange)
-			if(min(bestError / (refValue1+0.0001), bestError / (refValue2+0.0001)) > allowedRange)
-			{
-				f0Step3[j+1] = 0.0;
-				break;
-			}
-			if(i != negativeCount && j == positiveIndex[i+1]-1)
-			{
-				negativeIndex[j] = j;
-				break;
-			}
-		}
-	}
-
-	// ステップ4（後向き補正）
-	for(i = 0;i < f0Len;i++) f0Step4[i] = f0Step3[i];
-	for(i = positiveCount-1;i >= 0;i--)
-	{
-		for(j = positiveIndex[i]/*+1*/;j > 1;j--) //tn_fnds v0.0.4 
-		{
-			if(f0Step4[j-1] != 0) break;
-			refValue1 = f0Step4[j]*2 - f0Step4[j-1];
-			refValue2 = f0Step4[j];
-//			refValue = f0Step4[j]*2 - f0Step4[j+1];
-			bestError = min(fabs(refValue1 - f0Map[0][j+1]), fabs(refValue2 - f0Map[0][j+1]));
-//			bestError = abs(refValue - f0Map[0][j-1]);
-			for(k = 1;k < candidates;k++)
-			{
-				errorValue = min(fabs(refValue1 - f0Map[k][j-1]), fabs(refValue2 - f0Map[k][j-1]));
-//				errorValue = abs(refValue - f0Map[k][j-1]);
-//				if(min(bestError / (refValue1+0.0001), bestError / (refValue2+0.0001)) > allowedRange)
-				if(min(bestError / (refValue1+0.0001), bestError / (refValue2+0.0001)) > allowedRange && stabilityMap[k][j-1] < 0.1) //tn_fnds v0.0.4 安定性の低いF0は使用しない
-//				if(errorValue < bestError)
-				{
-					bestError = errorValue;
-					f0Step4[j-1] = f0Map[k][j-1];
-				}
-			}
-			if(min(bestError / (refValue1+0.0001), bestError / (refValue2+0.0001)) > allowedRange)
-//			if(bestError / (refValue+0.0001) > allowedRange)
-			{
-				f0Step4[j-1] = 0.0;
-				break;
-			}
-			if(i != 0 && j == negativeIndex[i-1]+1) break;
-		}
-	}
-
-	// コピー
-	for(i = 0;i < f0Len;i++) f0[i] = f0Step4[i];
-/* ステップ5は，性能が上がらないので一時的に削除
-	// ステップ5（孤立島の切り離し 2回目）
-	int voiceRangeMinimum2 = 2+(int)(voiceRangeMinimum/2);
-	for(i = 0;i < f0Len;i++) f0[i] = f0Step4[i];
-	for(i = voiceRangeMinimum2; i < f0Len-voiceRangeMinimum2;i++)
-	{
-		for(j = 0;j < voiceRangeMinimum2;j++)
-		{
-			if(f0Step4[i-j] == 0)
-				break;
-		}
-		for(k = 0;k < voiceRangeMinimum2;k++)
-		{
-			if(f0Step4[i+k] == 0)
-				break;
-		}
-		f0[i] = j != voiceRangeMinimum2 && k != voiceRangeMinimum2 ? 
-			0 : f0Step4[i];
-	}
-*/
-
-//候補点と補正結果のファイル出力　tn_fndsデバッグ用
-/*
-	FILE *file;
-
-	file = fopen("D:\\data\\YSS\\UTAU\\efb-gw20111228\\f0map.txt","w");
-
-	for(k = 1;k < candidates;k++) fprintf(file,",map%d",k);
-	for(k = 1;k < candidates;k++) fprintf(file,",stab%d",k);
-	fprintf(file,",BEST,base,step1,step2,step3,step4\n");
-	for(i = 0; i < f0Len; i++)
-	{
-		fprintf(file,"%d",i);
-		for(k = 1;k < candidates;k++) fprintf(file,",%f",f0Map[k][i]);
-		for(k = 1;k < candidates;k++) fprintf(file,",%f",stabilityMap[k][i]);
-		fprintf(file,",%f", bestF0[i]);
-		fprintf(file,",%f", f0Base[i]);
-		fprintf(file,",%f", f0Step1[i]);
-		fprintf(file,",%f", f0Step2[i]);
-		fprintf(file,",%f", f0Step3[i]);
-		fprintf(file,",%f\n",f0Step4[i]);
-	}
-	fclose(file);
-*/
-	// メモリの開放
-	free(bestF0Stab);
-	free(f0Base);
-	free(f0Step1); free(f0Step2); free(f0Step3); free(f0Step4);
+  delete[] f0_base;
 }
 
-// イベントを計算する内部関数 (内部変数なので引数・戻り値に手加減なし)
-void rawEventByDio(double boundaryF0, double fs, fftw_complex *xSpec, int xLength, int fftl, double framePeriod, double f0Floor, double f0Ceil, double *timeAxis, int tLen, 
-				   double *f0Deviations, double *interpolatedF0,
-				   fftw_plan &forwardFFT, fftw_plan &inverseFFT, double *equivalentFIR, fftw_complex *eSpec)
-{
-	int i;
-	int halfAverageLength = (int)(fs / boundaryF0 / 2 + 0.5);
-	int indexBias = halfAverageLength*2;
-//	double *equivalentFIR;
-//	equivalentFIR = (double *)malloc(sizeof(double) * fftl);
-	for(i = halfAverageLength*2;i < fftl;i++) equivalentFIR[i] = 0.0;
-	nuttallWindow(halfAverageLength*4, equivalentFIR);
+//-----------------------------------------------------------------------------
+// FixStep2() is the 2nd step of the postprocessing.
+// This function eliminates the suspected f0 in the anlaut and auslaut.
+//-----------------------------------------------------------------------------
+void FixStep2(double *f0_step1, int f0_length, int voice_range_minimum,
+    double *f0_step2) {
+  for (int i = 0; i < f0_length; ++i) f0_step2[i] = f0_step1[i];
 
-//tn_fnds v0.0.4 FFTWプランはDIO本体で作成することにした
-//	fftw_plan			forwardFFT;				// FFTセット
-//	fftw_complex		*eSpec;	// スペクトル
-//	eSpec = (fftw_complex *)malloc(sizeof(fftw_complex) * fftl);
-//	forwardFFT = fftw_plan_dft_r2c_1d(fftl, equivalentFIR, eSpec, FFTW_ESTIMATE);
-	fftw_execute(forwardFFT); // FFTの実行
-
-	// 複素数の掛け算
-	double tmp;
-//	for(i = 0;i <= fftl-1;i++)　
-	for(i = 0;i <= fftl>>1;i++)	//tn_fnds v0.0.4 FFT長の半分でいいはず
-	{
-		tmp = xSpec[i][0]*eSpec[i][0] - xSpec[i][1]*eSpec[i][1];
-		eSpec[i][1] = xSpec[i][0]*eSpec[i][1] + xSpec[i][1]*eSpec[i][0];
-		eSpec[i][0] = tmp;
-	}
-
-	// 低域通過フィルタリング
-//tn_fnds v0.0.4 FFTWプランはDIO本体で作成することにした
-//	fftw_plan	 inverseFFT;
-//	inverseFFT = fftw_plan_dft_c2r_1d(fftl, eSpec, equivalentFIR, FFTW_ESTIMATE);
-	fftw_execute(inverseFFT);
-	// バイアス（低域通過フィルタによる遅延）の除去
-	for(i = 0;i < xLength;i++) equivalentFIR[i] = equivalentFIR[i+indexBias];
-
-	// ４つのゼロ交差(構造体のほうがいいね) e:event, i:interval
-	double *nELocations, *pELocations, *dnELocations, *dpELocations;
-	double *nILocations, *pILocations, *dnILocations, *dpILocations;
-	double *nIntervals, *pIntervals, *dnIntervals, *dpIntervals;
-	int nLen, pLen, dnLen, dpLen;
-	nELocations = (double *)malloc(sizeof(double) * xLength); // xLengthはかなりの保険
-	pELocations = (double *)malloc(sizeof(double) * xLength);
-	dnELocations = (double *)malloc(sizeof(double) * xLength);
-	dpELocations = (double *)malloc(sizeof(double) * xLength);
-	nILocations = (double *)malloc(sizeof(double) * xLength);
-	pILocations = (double *)malloc(sizeof(double) * xLength);
-	dnILocations = (double *)malloc(sizeof(double) * xLength);
-	dpILocations = (double *)malloc(sizeof(double) * xLength);
-	nIntervals = (double *)malloc(sizeof(double) * xLength);
-	pIntervals = (double *)malloc(sizeof(double) * xLength);
-	dnIntervals = (double *)malloc(sizeof(double) * xLength);
-	dpIntervals = (double *)malloc(sizeof(double) * xLength);
-
-	zeroCrossingEngine(equivalentFIR, xLength, fs, 
-		nELocations, nILocations, nIntervals, &nLen);
-
-	for(i = 0;i < xLength;i++) equivalentFIR[i] = -equivalentFIR[i];
-	zeroCrossingEngine(equivalentFIR, xLength, fs, 
-		pELocations, pILocations, pIntervals, &pLen);
-
-	for(i = 0;i < xLength-1;i++) equivalentFIR[i] = equivalentFIR[i]-equivalentFIR[i+1];
-	zeroCrossingEngine(equivalentFIR, xLength-1, fs, 
-		dnELocations, dnILocations, dnIntervals, &dnLen);
-
-	for(i = 0;i < xLength-1;i++) equivalentFIR[i] = -equivalentFIR[i];
-	zeroCrossingEngine(equivalentFIR, xLength-1, fs, 
-		dpELocations, dpILocations, dpIntervals, &dpLen);
-
-
-	int usableChannel;
-	usableChannel = checkEvent(nLen-2) * checkEvent(pLen-2) * 
-		checkEvent(dnLen-2) * checkEvent(dpLen-2);
-
-	double *interpolatedF0Set[4];
-	if(usableChannel <= 0) 
-	{ // ノー候補でフィニッシュです
-		for(i = 0;i < tLen;i++)
-		{
-			f0Deviations[i] = 100000.0;
-			interpolatedF0[i] = 0.0;
-		}
-	}
-	else
-	{
-		for(i = 0;i < 4;i++)
-			interpolatedF0Set[i] = (double *)malloc(sizeof(double) * tLen);
-		// 4つのゼロ交差
-		interp1(nILocations , nIntervals , nLen , timeAxis, tLen, interpolatedF0Set[0]);
-		interp1(pILocations , pIntervals , pLen , timeAxis, tLen, interpolatedF0Set[1]);
-		interp1(dnILocations, dnIntervals, dnLen, timeAxis, tLen, interpolatedF0Set[2]);
-		interp1(dpILocations, dpIntervals, dpLen, timeAxis, tLen, interpolatedF0Set[3]);
-
-		for(i = 0;i < tLen;i++)
-		{
-			interpolatedF0[i] = (interpolatedF0Set[0][i] + interpolatedF0Set[1][i] + 
-				interpolatedF0Set[2][i] + interpolatedF0Set[3][i]) / 4.0;
-
-			f0Deviations[i]   = sqrt( ((interpolatedF0Set[0][i]-interpolatedF0[i])*(interpolatedF0Set[0][i]-interpolatedF0[i])
-				+ (interpolatedF0Set[1][i]-interpolatedF0[i])*(interpolatedF0Set[1][i]-interpolatedF0[i])
-				+ (interpolatedF0Set[2][i]-interpolatedF0[i])*(interpolatedF0Set[2][i]-interpolatedF0[i])
-				+ (interpolatedF0Set[3][i]-interpolatedF0[i])*(interpolatedF0Set[3][i]-interpolatedF0[i])) / 3.0);
-
-			if(interpolatedF0[i] > boundaryF0 || interpolatedF0[i] < boundaryF0/2.0 
-				|| interpolatedF0[i] > f0Ceil || interpolatedF0[i] < FLOOR_F0) // 70 Hz以下はF0としない．
-			{
-				interpolatedF0[i] = 0.0;
-				f0Deviations[i]   = 100000.0;
-			}
-		}
-
-		for(i = 0;i < 4;i++) free(interpolatedF0Set[i]);
-	}
-
-
-	// メモリの開放
-	free(nELocations); free(pELocations); free(dnELocations); free(dpELocations);
-	free(nILocations); free(pILocations); free(dnILocations); free(dpILocations);
-	free(nIntervals); free(pIntervals); free(dnIntervals); free(dpIntervals);
-//	fftw_destroy_plan(inverseFFT);	
-//	fftw_destroy_plan(forwardFFT);
-//	free(eSpec);
-//	free(equivalentFIR);
+  int center = (voice_range_minimum - 1) / 2;
+  for (int i = center; i < f0_length - center; ++i) {
+    for (int j = -center; j <= center; ++j) {
+      if (f0_step1[i + j] == 0) {
+        f0_step2[i] = 0.0;
+        break;
+      }
+    }
+  }
 }
 
-// ゼロ交差を計算
-void zeroCrossingEngine(double *x, int xLen, double fs,
-						double *eLocations, double *iLocations, double *intervals, int *iLen)
-{
-	int i;
-	int *negativeGoingPoints;
-	negativeGoingPoints = (int *)malloc(sizeof(int) * xLen);
-
-	int tmp1, tmp2;
-	for(i = 0;i < xLen-1;i++) // 毎回余りを計算するのは無駄
-	{
-		tmp1 = x[i]*x[i+1] < 0 ? 1 : 0;
-		tmp2 = x[i+1] < x[i]   ? 1 : 0;
-		negativeGoingPoints[i] = (i+1) * tmp1 * tmp2;
-	}
-	negativeGoingPoints[xLen-1] = 0;
-
-	// 有効イベントの検出
-	int *edges;
-	edges = (int *)malloc(sizeof(int) * xLen);
-	int count = 0;
-	for(i = 0;i < xLen;i++)
-	{
-		if(negativeGoingPoints[i] > 0) edges[count++] = negativeGoingPoints[i];
-	}
-	// 最終戻り値の計算準備
-	double *fineEdges;
-	fineEdges = (double *)malloc(sizeof(double) * count);
-	for(i = 0;i < count;i++)
-	{
-		fineEdges[i] = (double)edges[i] - x[edges[i]-1]/(x[edges[i]]-x[edges[i]-1]);
-	}
-
-	*iLen = count-1;
-	for(i = 0;i < *iLen;i++)
-	{
-		intervals[i] = fs / (fineEdges[i+1] - fineEdges[i]);
-		iLocations[i] = (fineEdges[i]+fineEdges[i+1])/2.0/fs;
-		eLocations[i] = fineEdges[i]/fs;
-	}
-	if(count != 0) eLocations[count-1] = fineEdges[count-1]/fs;  //0の場合を考慮
-
-	free(fineEdges);
-	free(edges);
-	free(negativeGoingPoints);
+//-----------------------------------------------------------------------------
+// CountNumberOfVoicedSections() counts the number of voiced sections.
+//-----------------------------------------------------------------------------
+void CountNumberOfVoicedSections(double *f0_step2, int f0_length,
+    int *positive_index, int *negative_index, int *positive_count,
+    int *negative_count) {
+  *positive_count = *negative_count = 0;
+  for (int i = 1; i < f0_length; ++i) {
+    if (f0_step2[i] == 0 && f0_step2[i - 1] != 0) {
+      negative_index[(*negative_count)++] = i - 1;
+    } else {
+      if (f0_step2[i - 1] == 0 && f0_step2[i] != 0)
+        positive_index[(*positive_count)++] = i;
+    }
+  }
 }
 
-// ナットール窓．マジックナンバーのように見えるけどこれが正解．
-void nuttallWindow(int yLen, double *y)
-{
-	int i;
-	double tmp;
-	for(i = 0;i < yLen;i++)
-	{
-		tmp  = ((double)(i+1) - (double)(yLen+1)/2.0) / (double)(yLen+1);
-		y[i] = 0.355768+0.487396*cos(2*PI*tmp)+0.144232*cos(4*PI*tmp)+0.012604*cos(6*PI*tmp);
-	}
+//-----------------------------------------------------------------------------
+// SelectOneF0() corrects the f0[current_index] based on
+// f0[current_index + sign].
+//-----------------------------------------------------------------------------
+double SelectBestF0(double current_f0, double past_f0, double **f0_candidates,
+    int number_of_candidates, int target_index, double allowed_range) {
+  double reference_f0 = (current_f0 * 3.0 - past_f0) / 2.0;
+
+  double minimum_error = fabs(reference_f0 - f0_candidates[0][target_index]);
+  double best_f0 = f0_candidates[0][target_index];
+
+  double current_error;
+  for (int i = 1; i < number_of_candidates; ++i) {
+    current_error = fabs(reference_f0 - f0_candidates[i][target_index]);
+    if (current_error < minimum_error) {
+      minimum_error = current_error;
+      best_f0 = f0_candidates[i][target_index];
+    }
+  }
+  if (fabs(1.0 - best_f0 / reference_f0) > allowed_range)
+    return 0.0;
+  return best_f0;
 }
 
+//-----------------------------------------------------------------------------
+// FixStep3() is the 3rd step of the postprocessing.
+// This function corrects the f0 candidates from backward to forward.
+//-----------------------------------------------------------------------------
+void FixStep3(double *f0_step2, int f0_length, double **f0_candidates,
+    int number_of_candidates, double allowed_range, int *negative_index,
+    int negative_count, double *f0_step3) {
+  for (int i = 0; i < f0_length; i++) f0_step3[i] = f0_step2[i];
 
+  int limit;
+  for (int i = 0; i < negative_count; ++i) {
+    limit = i == negative_count - 1 ? f0_length - 1 : negative_index[i + 1];
+    for (int j = negative_index[i]; j < limit; ++j) {
+      f0_step3[j + 1] =
+        SelectBestF0(f0_step3[j], f0_step3[j - 1], f0_candidates,
+            number_of_candidates, j + 1, allowed_range);
+      if (f0_step3[j + 1] == 0) break;
+    }
+  }
+}
 
+//-----------------------------------------------------------------------------
+// BackwardCorrection() is the 4th step of the postprocessing.
+// This function corrects the f0 candidates from forward to backward.
+//-----------------------------------------------------------------------------
+void FixStep4(double *f0_step3, int f0_length, double **f0_candidates,
+    int number_of_candidates, double allowed_range, int *positive_index,
+    int positive_count, double *f0_step4) {
+  for (int i = 0; i < f0_length; ++i) f0_step4[i] = f0_step3[i];
 
+  int limit;
+  for (int i = positive_count - 1; i >= 0; --i) {
+    limit = i == 0 ? 1 : positive_index[i - 1];
+    for (int j = positive_index[i]; j > limit; --j) {
+      f0_step4[j - 1] =
+        SelectBestF0(f0_step4[j], f0_step4[j + 1], f0_candidates,
+            number_of_candidates, j - 1, allowed_range);
+      if (f0_step4[j - 1] == 0) break;
+    }
+  }
+}
+
+//-----------------------------------------------------------------------------
+// FixF0Contour() calculates the definitive f0 contour based on all f0
+// candidates. There are four steps.
+//-----------------------------------------------------------------------------
+void FixF0Contour(double frame_period, int number_of_candidates,
+    int fs, double **f0_candidates, double *best_f0_contour, int f0_length,
+    double f0_floor, double *fixed_f0_contour) {
+  // memo:
+  // These are the tentative values. Optimization should be required.
+  int voice_range_minimum =
+    static_cast<int>(0.5 + 1000.0 / frame_period / f0_floor) * 2 + 1;
+  double allowed_range = 0.02 * frame_period;
+
+  double *f0_tmp1 = new double[f0_length];
+  double *f0_tmp2 = new double[f0_length];
+
+  FixStep1(best_f0_contour, f0_length, voice_range_minimum,
+      allowed_range, f0_tmp1);
+  FixStep2(f0_tmp1, f0_length, voice_range_minimum, f0_tmp2);
+
+  int positive_count, negative_count;
+  int *positive_index = new int[f0_length];
+  int *negative_index = new int[f0_length];
+  CountNumberOfVoicedSections(f0_tmp2, f0_length, positive_index,
+      negative_index, &positive_count, &negative_count);
+  FixStep3(f0_tmp2, f0_length, f0_candidates, number_of_candidates,
+      allowed_range, negative_index, negative_count, f0_tmp1);
+  FixStep4(f0_tmp1, f0_length, f0_candidates, number_of_candidates,
+      allowed_range, positive_index, positive_count, fixed_f0_contour);
+
+  delete[] f0_tmp1;
+  delete[] f0_tmp2;
+  delete[] positive_index;
+  delete[] negative_index;
+}
+
+//-----------------------------------------------------------------------------
+// NuttallWindow() calculates the coefficients of Nuttall window whose length
+// is y_length.
+//-----------------------------------------------------------------------------
+void NuttallWindow(int y_length, double *y) {
+  double tmp;
+  for (int i = 0; i < y_length; ++i) {
+    tmp  = (i + 1 - (y_length + 1) / 2.0) / (y_length + 1);
+    y[i] = 0.355768 + 0.487396 * cos(2 * world::kPi * tmp) +
+      0.144232 * cos(4.0 * world::kPi * tmp) +
+      0.012604 * cos(6.0 * world::kPi * tmp);
+  }
+}
+
+//-----------------------------------------------------------------------------
+// GetFilteredSignal() calculates the signal that is the convolution of the
+// input signal and low-pass filter.
+// This function is only used in RawEventByDio()
+//-----------------------------------------------------------------------------
+void GetFilteredSignal(int half_average_length, int fft_size,
+    fft_complex *y_spectrum, int y_length, double *filtered_signal) {
+  double *low_pass_filter = new double[fft_size];
+  // Nuttall window is used as a low-pass filter.
+  // Cutoff frequency depends on the window length.
+  NuttallWindow(half_average_length * 4, low_pass_filter);
+  for (int i = half_average_length * 4; i < fft_size; ++i)
+    low_pass_filter[i] = 0.0;
+
+  fft_complex *low_pass_filter_spectrum = new fft_complex[fft_size];
+  fft_plan forwardFFT = fft_plan_dft_r2c_1d(fft_size, low_pass_filter,
+      low_pass_filter_spectrum, FFT_ESTIMATE);
+  fft_execute(forwardFFT);
+
+  // Convolution
+  double tmp = y_spectrum[0][0] * low_pass_filter_spectrum[0][0] -
+    y_spectrum[0][1] * low_pass_filter_spectrum[0][1];
+  low_pass_filter_spectrum[0][1] =
+    y_spectrum[0][0] * low_pass_filter_spectrum[0][1] +
+    y_spectrum[0][1] * low_pass_filter_spectrum[0][0];
+  low_pass_filter_spectrum[0][0] = tmp;
+  for (int i = 1; i <= fft_size / 2; ++i) {
+    tmp = y_spectrum[i][0] * low_pass_filter_spectrum[i][0] -
+      y_spectrum[i][1] * low_pass_filter_spectrum[i][1];
+    low_pass_filter_spectrum[i][1] =
+      y_spectrum[i][0] * low_pass_filter_spectrum[i][1] +
+      y_spectrum[i][1] * low_pass_filter_spectrum[i][0];
+    low_pass_filter_spectrum[i][0] = tmp;
+    low_pass_filter_spectrum[fft_size - i - 1][0] =
+      low_pass_filter_spectrum[i][0];
+    low_pass_filter_spectrum[fft_size - i - 1][1] =
+      low_pass_filter_spectrum[i][1];
+  }
+
+  fft_plan inverseFFT = fft_plan_dft_c2r_1d(fft_size,
+      low_pass_filter_spectrum, filtered_signal, FFT_ESTIMATE);
+  fft_execute(inverseFFT);
+
+  // Compensation of the delay.
+  int index_bias = half_average_length * 2;
+  for (int i = 0; i < y_length; ++i)
+    filtered_signal[i] = filtered_signal[i + index_bias];
+
+  fft_destroy_plan(inverseFFT);
+  fft_destroy_plan(forwardFFT);
+  delete[] low_pass_filter_spectrum;
+  delete[] low_pass_filter;
+}
+
+//-----------------------------------------------------------------------------
+// CheckEvent() returns 1, provided that the input value is over 1.
+// This function is for RawEventByDio().
+//-----------------------------------------------------------------------------
+inline int CheckEvent(int x) {
+  return x > 0 ? 1 : 0;
+}
+
+//-----------------------------------------------------------------------------
+// ZeroCrossingEngine() calculates the zero crossing points from positive to
+// negative. Thanks to Custom.Maid http://custom-made.seesaa.net/ (2012/8/19)
+//-----------------------------------------------------------------------------
+int ZeroCrossingEngine(double *filtered_signal, int y_length, double fs,
+    double *interval_locations, double *intervals) {
+  int *negative_going_points = new int[y_length];
+
+  for (int i = 0; i < y_length - 1; ++i)
+    negative_going_points[i] =
+      0.0 < filtered_signal[i] && filtered_signal[i + 1] <= 0.0 ? i + 1 : 0;
+  negative_going_points[y_length - 1] = 0;
+
+  int *edges = new int[y_length];
+  int count = 0;
+  for (int i = 0; i < y_length; ++i)
+    if (negative_going_points[i] > 0)
+      edges[count++] = negative_going_points[i];
+
+  if (count < 2) {
+    delete[] edges;
+    delete[] negative_going_points;
+    return 0;
+  }
+
+  double *fine_edges = new double[count];
+  for (int i = 0; i < count; ++i)
+    fine_edges[i] =
+      edges[i] - filtered_signal[edges[i] - 1] /
+      (filtered_signal[edges[i]] - filtered_signal[edges[i] - 1]);
+
+  for (int i = 0; i < count - 1; ++i) {
+    intervals[i] = fs / (fine_edges[i + 1] - fine_edges[i]);
+    interval_locations[i] = (fine_edges[i] + fine_edges[i + 1]) / 2.0 / fs;
+  }
+
+  delete[] fine_edges;
+  delete[] edges;
+  delete[] negative_going_points;
+  return count - 1;
+}
+
+//-----------------------------------------------------------------------------
+// GetFourZeroCrossingIntervals() calculates four zero-crossing intervals.
+// (1) Zero-crossing going from negative to positive.
+// (2) Zero-crossing going from positive to negative.
+// (3) Peak, and (4) dip. (3) and (4) are calculated from the zero-crossings of
+// the differential of waveform.
+//-----------------------------------------------------------------------------
+void GetFourZeroCrossingIntervals(double *filtered_signal, int y_length,
+    double actual_fs, ZeroCrossings *zero_crossings) {
+  // x_length / 4 (old version) is fixed at 2013/07/14
+  const int kMaximumNumber = y_length;
+  zero_crossings->negative_interval_locations = new double[kMaximumNumber];
+  zero_crossings->positive_interval_locations = new double[kMaximumNumber];
+  zero_crossings->peak_interval_locations = new double[kMaximumNumber];
+  zero_crossings->dip_interval_locations = new double[kMaximumNumber];
+  zero_crossings->negative_intervals = new double[kMaximumNumber];
+  zero_crossings->positive_intervals = new double[kMaximumNumber];
+  zero_crossings->peak_intervals = new double[kMaximumNumber];
+  zero_crossings->dip_intervals = new double[kMaximumNumber];
+
+  zero_crossings->number_of_negatives = ZeroCrossingEngine(filtered_signal,
+      y_length, actual_fs, zero_crossings->negative_interval_locations,
+      zero_crossings->negative_intervals);
+
+  for (int i = 0; i < y_length; ++i) filtered_signal[i] = -filtered_signal[i];
+  zero_crossings->number_of_positives = ZeroCrossingEngine(filtered_signal,
+      y_length, actual_fs, zero_crossings->positive_interval_locations,
+      zero_crossings->positive_intervals);
+
+  for (int i = 0; i < y_length - 1; ++i) filtered_signal[i] =
+    filtered_signal[i] - filtered_signal[i + 1];
+  zero_crossings->number_of_peaks = ZeroCrossingEngine(filtered_signal,
+      y_length - 1, actual_fs, zero_crossings->peak_interval_locations,
+      zero_crossings->peak_intervals);
+
+  for (int i = 0; i < y_length - 1; ++i)
+    filtered_signal[i] = -filtered_signal[i];
+  zero_crossings->number_of_dips = ZeroCrossingEngine(filtered_signal,
+      y_length - 1, actual_fs, zero_crossings->dip_interval_locations,
+      zero_crossings->dip_intervals);
+}
+
+//-----------------------------------------------------------------------------
+// GetF0CandidatesSub() calculates the f0 candidates and deviations.
+// This is the sub-function of GetF0Candidates() and assumes the calculation.
+//-----------------------------------------------------------------------------
+void GetF0CandidatesSub(double **interpolated_f0_set, int time_axis_length,
+    double f0_floor, double f0_ceil, double boundary_f0,
+    double *f0_candidates, double *f0_deviations) {
+  for (int i = 0; i < time_axis_length; ++i) {
+    f0_candidates[i] = (interpolated_f0_set[0][i] +
+      interpolated_f0_set[1][i] + interpolated_f0_set[2][i] +
+      interpolated_f0_set[3][i]) / 4.0;
+
+    f0_deviations[i] = sqrt(((interpolated_f0_set[0][i] - f0_candidates[i]) *
+      (interpolated_f0_set[0][i] - f0_candidates[i]) +
+      (interpolated_f0_set[1][i] - f0_candidates[i]) *
+      (interpolated_f0_set[1][i] - f0_candidates[i]) +
+      (interpolated_f0_set[2][i] - f0_candidates[i]) *
+      (interpolated_f0_set[2][i] - f0_candidates[i]) +
+      (interpolated_f0_set[3][i] - f0_candidates[i]) *
+      (interpolated_f0_set[3][i] - f0_candidates[i])) / 3.0);
+
+    if (f0_candidates[i] > boundary_f0 ||
+        f0_candidates[i] < boundary_f0 / 2.0 ||
+        f0_candidates[i] > f0_ceil || f0_candidates[i] < f0_floor) {
+      f0_candidates[i] = 0.0;
+      f0_deviations[i] = world::kMaximumValue;
+    }
+  }
+}
+
+//-----------------------------------------------------------------------------
+// GetF0Candidates() calculates the F0 candidates based on the zero-crossings.
+// Calculation of F0 candidates is carried out in GetF0CandidatesSub().
+//-----------------------------------------------------------------------------
+void GetF0Candidates(const ZeroCrossings *zero_crossings, double boundary_f0,
+  double f0_floor, double f0_ceil, double *time_axis, int time_axis_length,
+  double *f0_candidates, double *f0_deviations) {
+  if (0 == CheckEvent(zero_crossings->number_of_negatives - 2) *
+      CheckEvent(zero_crossings->number_of_positives - 2) *
+      CheckEvent(zero_crossings->number_of_peaks - 2) *
+      CheckEvent(zero_crossings->number_of_dips - 2)) {
+    for (int i = 0; i < time_axis_length; ++i) {
+      f0_deviations[i] = world::kMaximumValue;
+      f0_candidates[i] = 0.0;
+    }
+    return;
+  }
+
+  double *interpolated_f0_set[4];
+  for (int i = 0; i < 4; ++i)
+    interpolated_f0_set[i] = new double[time_axis_length];
+
+  interp1(zero_crossings->negative_interval_locations,
+      zero_crossings->negative_intervals,
+      zero_crossings->number_of_negatives,
+      time_axis, time_axis_length, interpolated_f0_set[0]);
+  interp1(zero_crossings->positive_interval_locations,
+      zero_crossings->positive_intervals,
+      zero_crossings->number_of_positives,
+      time_axis, time_axis_length, interpolated_f0_set[1]);
+  interp1(zero_crossings->peak_interval_locations,
+      zero_crossings->peak_intervals, zero_crossings->number_of_peaks,
+      time_axis, time_axis_length, interpolated_f0_set[2]);
+  interp1(zero_crossings->dip_interval_locations,
+      zero_crossings->dip_intervals, zero_crossings->number_of_dips,
+      time_axis, time_axis_length, interpolated_f0_set[3]);
+
+  GetF0CandidatesSub(interpolated_f0_set, time_axis_length, f0_floor,
+      f0_ceil, boundary_f0, f0_candidates, f0_deviations);
+  for (int i = 0; i < 4; ++i) delete[] interpolated_f0_set[i];
+}
+
+//-----------------------------------------------------------------------------
+// DestroyZeroCrossings() frees the memory of array in the struct
+//-----------------------------------------------------------------------------
+void DestroyZeroCrossings(ZeroCrossings *zero_crossings) {
+  delete[] zero_crossings->negative_interval_locations;
+  delete[] zero_crossings->positive_interval_locations;
+  delete[] zero_crossings->peak_interval_locations;
+  delete[] zero_crossings->dip_interval_locations;
+  delete[] zero_crossings->negative_intervals;
+  delete[] zero_crossings->positive_intervals;
+  delete[] zero_crossings->peak_intervals;
+  delete[] zero_crossings->dip_intervals;
+}
+
+//-----------------------------------------------------------------------------
+// RawEventByDio() calculates the zero-crossings.
+//-----------------------------------------------------------------------------
+void CalculateRawEvent(double boundary_f0, double fs, fft_complex *y_spectrum,
+    int y_length, int fft_size, double f0_floor, double f0_ceil,
+    double *time_axis, int time_axis_length, double *f0_deviations,
+    double *f0_candidates) {
+  double *filtered_signal = new double[fft_size];
+  GetFilteredSignal(matlab_round(fs / boundary_f0 / 2.0), fft_size, y_spectrum,
+      y_length, filtered_signal);
+
+  ZeroCrossings zero_crossings = {0};
+  GetFourZeroCrossingIntervals(filtered_signal, y_length, fs,
+      &zero_crossings);
+
+  GetF0Candidates(&zero_crossings, boundary_f0, f0_floor, f0_ceil,
+      time_axis, time_axis_length, f0_candidates, f0_deviations);
+
+  DestroyZeroCrossings(&zero_crossings);
+  delete[] filtered_signal;
+}
+
+//-----------------------------------------------------------------------------
+// GetF0CandidateAndStabilityMap() calculates all f0 candidates and
+// their stabilities.
+//-----------------------------------------------------------------------------
+void GetF0CandidateAndStabilityMap(double *boundary_f0_list,
+    int number_of_bands, double actual_fs, int y_length,
+    double *time_axis, int f0_length, fft_complex *y_spectrum,
+    int fft_size, double f0_floor, double f0_ceil,
+    double **f0_candidate_map, double **f0_stability_map) {
+  double * f0_candidates = new double[f0_length];
+  double * f0_deviations = new double[f0_length];
+
+  // Calculation of the acoustics events (zero-crossing)
+  for (int i = 0; i < number_of_bands; ++i) {
+    CalculateRawEvent(boundary_f0_list[i], actual_fs, y_spectrum,
+        y_length, fft_size, f0_floor, f0_ceil, time_axis, f0_length,
+        f0_deviations, f0_candidates);
+    for (int j = 0; j < f0_length; ++j) {
+      // A way to avoid zero division
+      f0_stability_map[i][j] = f0_deviations[j] /
+        (f0_candidates[j] + world::kMySafeGuardMinimum);
+      f0_candidate_map[i][j] = f0_candidates[j];
+    }
+  }
+
+  delete[] f0_candidates;
+  delete[] f0_deviations;
+}
+
+//-----------------------------------------------------------------------------
+// OriginalDio() estimates the F0 based on Distributed Inline-filter Operation.
+//-----------------------------------------------------------------------------
+void OriginalDio(double *x, int x_length, int fs, double frame_period,
+    double f0_floor, double f0_ceil, double channels_in_octave, int speed,
+    double *time_axis, double *f0) {
+  int number_of_bands = 2 + static_cast<int>(log(f0_ceil / f0_floor) /
+    world::kLog2 * channels_in_octave);
+  double * boundary_f0_list = new double[number_of_bands];
+  for (int i = 0; i < number_of_bands; ++i)
+    boundary_f0_list[i] = f0_floor * pow(2.0, i / channels_in_octave);
+
+  // normalization
+  int decimation_ratio = MyMax(MyMin(speed, 12), 1);
+  int y_length = (1 + static_cast<int>(x_length / decimation_ratio));
+  double actual_fs = static_cast<double>(fs) / decimation_ratio;
+  int fft_size = GetSuitableFFTSize(y_length +
+      (4 * static_cast<int>(1.0 + actual_fs / boundary_f0_list[0] / 2.0)));
+
+  // Calculation of the spectrum used for the f0 estimation
+  fft_complex *y_spectrum = new fft_complex[fft_size];
+  GetSpectrumForEstimation(x, x_length, y_length, actual_fs, fft_size,
+      decimation_ratio, y_spectrum);
+
+  // f0map represents all F0 candidates. We can modify them.
+  double **f0_candidate_map = new double *[number_of_bands];
+  double **f0_stability_map = new double *[number_of_bands];
+  int f0_length = GetSamplesForDIO(fs, x_length, frame_period);
+  for (int i = 0; i < number_of_bands; ++i) {
+    f0_candidate_map[i] = new double[f0_length];
+    f0_stability_map[i] = new double[f0_length];
+  }
+
+  for (int i = 0; i < f0_length; ++i)
+    time_axis[i] = i * frame_period / 1000.0;
+
+  GetF0CandidateAndStabilityMap(boundary_f0_list, number_of_bands,
+      actual_fs, y_length, time_axis, f0_length, y_spectrum,
+      fft_size, f0_floor, f0_ceil, f0_candidate_map, f0_stability_map);
+
+  // Selection of the best value based on fundamental-ness.
+  double *best_f0_contour = new double[f0_length];
+  GetBestF0Contour(f0_length, f0_candidate_map, f0_stability_map,
+      number_of_bands, best_f0_contour);
+
+  // Postprocessing to find the best f0-contour.
+  FixF0Contour(frame_period, number_of_bands, fs, f0_candidate_map,
+      best_f0_contour, f0_length, f0_floor, f0);
+
+  delete[] best_f0_contour;
+  delete[] y_spectrum;
+  for (int i = 0; i < number_of_bands; ++i) {
+    delete[] f0_stability_map[i];
+    delete[] f0_candidate_map[i];
+  }
+  delete[] f0_stability_map;
+  delete[] f0_candidate_map;
+  delete[] boundary_f0_list;
+}
+
+}  // namespace
+
+int GetSamplesForDIO(int fs, int x_length, double frame_period) {
+  return static_cast<int>(x_length / static_cast<double>(fs) /
+    (frame_period / 1000.0)) + 1;
+}
+
+void Dio(double *x, int x_length, int fs, const DioOption option,
+    double *time_axis, double *f0) {
+  OriginalDio(x, x_length, fs, option.frame_period, option.f0_floor,
+      option.f0_ceil, option.channels_in_octave, option.speed, time_axis, f0);
+}
+
+void Dio(double *x, int x_length, int fs, double frame_period,
+    double *time_axis, double *f0) {
+  const double kTargetFs = 4000.0;
+  const double kF0Floor = 57.0;
+  const double kF0Ceil = 1050.0;
+  const double kChannelsInOctave = 2.0;
+  const int kDecimationRatio = static_cast<int>(fs / kTargetFs);
+
+  OriginalDio(x, x_length, fs, frame_period, kF0Floor, kF0Ceil,
+      kChannelsInOctave, kDecimationRatio, time_axis, f0);
+}
+
+void InitializeDioOption(DioOption *option) {
+  // You can change default parameters.
+  option->channels_in_octave = 2.0;
+  option->f0_ceil = 1050.0;
+  option->f0_floor = 57.0;
+  option->frame_period = 5;
+
+  // You can use from 1 to 12.
+  // Default value is for the fs of 44.1 kHz.
+  // The lower value you use, the better performance you can obtain.
+  option->speed = 1;
+}

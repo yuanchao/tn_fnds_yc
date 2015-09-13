@@ -80,23 +80,23 @@ void starGeneralBody(double *x, int xLen, int fs, double f0, double t, int fftl,
 	waveform  = (double *)malloc(sizeof(double) * fftl);
 	powerSpec = (double *)malloc(sizeof(double) * fftl);
 
-	fftw_plan			forwardFFT;	// FFTセット
-	fftw_complex		*ySpec;		// スペクトル
-	ySpec = (fftw_complex *)malloc(sizeof(fftw_complex) * fftl);
-	forwardFFT = fftw_plan_dft_r2c_1d(fftl, waveform, ySpec, FFTW_ESTIMATE);
+	fft_plan			forwardFFT;	// FFTセット
+	fft_complex		*ySpec;		// スペクトル
+	ySpec = (fft_complex *)malloc(sizeof(fft_complex) * fftl);
+	forwardFFT = fft_plan_dft_r2c_1d(fftl, waveform, ySpec, FFT_ESTIMATE);
 
 	// パワースペクトルの計算
 	for(i = 0;i <= nFragment*2;i++) 
 		waveform[i] = segment[i] * window[i];
 	for(;i < fftl;i++) 
 		waveform[i] = 0.0;
-	fftw_execute(forwardFFT); // FFTの実行
+	fft_execute(forwardFFT); // FFTの実行
 	for(i = 1;i <= fftl/2;i++) 
 		powerSpec[i] = ySpec[i][0]*ySpec[i][0] + ySpec[i][1]*ySpec[i][1];
 	powerSpec[0] = powerSpec[1];
 
 	free(ySpec);
-	fftw_destroy_plan(forwardFFT);
+	fft_destroy_plan(forwardFFT);
 	free(segment);
 	free(window);
 	free(baseIndex); free(index);

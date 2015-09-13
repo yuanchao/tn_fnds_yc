@@ -2,6 +2,7 @@
 //í«â¡Ç≥ÇÍÇƒÇ¢ÇÈÉRÉÅÉìÉgÇ…ÇÕåÎÇËÇ™Ç†ÇÈÇ©Ç‡ÇµÇÍÇ‹ÇπÇÒÅB
 
 #include "world.h"
+#include "dio.h"
 
 #include <stdio.h> // for debug
 #include <stdlib.h>
@@ -294,7 +295,7 @@ void pt100(double *x, int xLen, int fs, double *timeAxis, double *f0,
 	double framePeriod = (timeAxis[1]-timeAxis[0])*1000.0;
 
 	int	fftl = (int)pow(2.0, 1.0+(int)(log(3.0*fs/FLOOR_F0+1) / log(2.0)));
-	int tLen = getSamplesForDIO(fs, xLen, framePeriod);
+	int tLen = GetSamplesForDIO(fs, xLen, framePeriod);
 
 	int vuvNum;
 	vuvNum = 0;
@@ -400,7 +401,7 @@ int pt101(double *x, int xLen, int fs, double *timeAxis, double *f0,
 	double framePeriod = (timeAxis[1]-timeAxis[0])*1000.0;
 
 	int	fftl = (int)pow(2.0, 1.0+(int)(log(3.0*fs/FLOOR_F0+1) / log(2.0)));
-	int tLen = getSamplesForDIO(fs, xLen, framePeriod);
+	int tLen = GetSamplesForDIO(fs, xLen, framePeriod);
 
 	int vuvNum;
 //	vuvNum = 0;
