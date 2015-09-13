@@ -182,7 +182,7 @@ bool GetParameters(FILE *fp, int *fs, int *nbit, int *wav_length) {
   unsigned char for_int_number[4];
   fread(for_int_number, 1, 4, fp);
   *fs = 0;
-  for (int i = 3; i >= 0; --i) *fs = *fs * 256 + for_int_number[i];
+  for (int i = 3; i >= 0; --i) *fs = (*fs << 8) + for_int_number[i];
   // Quantization
   fseek(fp, 6, SEEK_CUR);
   fread(for_int_number, 1, 2, fp);
@@ -207,7 +207,7 @@ bool GetParameters(FILE *fp, int *fs, int *nbit, int *wav_length) {
   fread(for_int_number, 1, 4, fp);  // "data"
   *wav_length = 0;
   for (int i = 3; i >= 0; --i)
-    *wav_length = *wav_length * 256 + for_int_number[i];
+    *wav_length = (*wav_length << 8) + for_int_number[i];
   *wav_length /= (*nbit / 8);
   return true;
 }
