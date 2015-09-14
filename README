@@ -1,0 +1,4 @@
+Configuring and compiling with the following:
+
+$ aclocal ; autoheader; automake --add-missing ; autoconf
+$ ./configure --host 'i586-mingw32msvc'
